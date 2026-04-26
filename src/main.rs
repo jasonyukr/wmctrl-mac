@@ -28,11 +28,39 @@ use std::process;
 type CGWindowID = c_uint;
 type AXError = c_int;
 type AXUIElementRef = *const c_void;
+type OSStatus = i32;
+type OSType = u32;
+type DescType = OSType;
+type AEEventClass = OSType;
+type AEEventID = OSType;
+type AEReturnID = i16;
+type AETransactionID = i32;
+type AESendMode = i32;
+type Size = libc::c_long;
+type AEAddressDesc = AEDesc;
+type AppleEvent = AEDesc;
+
+#[repr(C, packed(2))]
+struct AEDesc {
+    descriptor_type: DescType,
+    data_handle: *mut c_void,
+}
 
 const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: c_uint = 16;
 const K_CG_NULL_WINDOW_ID: CGWindowID = 0;
 const K_AX_ERROR_SUCCESS: AXError = 0;
 const NS_APPLICATION_ACTIVATE_IGNORING_OTHER_APPS: u64 = 1;
+const TYPE_KERNEL_PROCESS_ID: DescType = fourcc(*b"kpid");
+const K_CORE_EVENT_CLASS: AEEventClass = fourcc(*b"aevt");
+const K_AE_REOPEN_APPLICATION: AEEventID = fourcc(*b"rapp");
+const K_AUTO_GENERATE_RETURN_ID: AEReturnID = -1;
+const K_ANY_TRANSACTION_ID: AETransactionID = 0;
+const K_AE_NO_REPLY: AESendMode = 1;
+const K_AE_DEFAULT_TIMEOUT: libc::c_long = -1;
+
+const fn fourcc(value: [u8; 4]) -> OSType {
+    u32::from_be_bytes(value)
+}
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -67,6 +95,33 @@ unsafe extern "C" {
     ) -> AXError;
     fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
     fn _AXUIElementGetWindow(element: AXUIElementRef, identifier: *mut CGWindowID) -> AXError;
+
+    fn AECreateDesc(
+        descriptor_type: DescType,
+        data_ptr: *const c_void,
+        data_size: Size,
+        result: *mut AEDesc,
+    ) -> OSStatus;
+    fn AECreateAppleEvent(
+        event_class: AEEventClass,
+        event_id: AEEventID,
+        target: *const AEAddressDesc,
+        return_id: AEReturnID,
+        transaction_id: AETransactionID,
+        result: *mut AppleEvent,
+    ) -> OSStatus;
+    fn AESendMessage(
+        event: *const AppleEvent,
+        reply: *mut AppleEvent,
+        send_mode: AESendMode,
+        time_out_in_ticks: libc::c_long,
+    ) -> OSStatus;
+    fn AEDisposeDesc(desc: *mut AEDesc) -> OSStatus;
+}
+
+#[link(name = "CoreServices", kind = "framework")]
+unsafe extern "C" {
+    fn LSOpenCFURLRef(in_url: CFTypeRef, out_launched_url: *mut CFTypeRef) -> OSStatus;
 }
 
 #[link(name = "AppKit", kind = "framework")]
@@ -1171,20 +1226,125 @@ fn launch_or_focus_application(app_name: &str) -> Result<(), String> {
                 continue;
             };
             if app_name_matches(&name, app_name) {
+                let pid: pid_t = msg_send![application, processIdentifier];
                 let activated: bool = msg_send![application, activateWithOptions: NS_APPLICATION_ACTIVATE_IGNORING_OTHER_APPS];
-                return activated
-                    .then_some(())
-                    .ok_or_else(|| format!("failed to activate {app_name}"));
+                if !activated {
+                    return Err(format!("failed to activate {app_name}"));
+                }
+                if running_application_has_usable_windows(pid, &name) {
+                    return Ok(());
+                }
+
+                let lsopen_status = launch_running_application_url(workspace, application);
+                let reopen_status = if lsopen_status == 0 {
+                    0
+                } else {
+                    send_reopen_application(pid)
+                };
+                let activated: bool = msg_send![application, activateWithOptions: NS_APPLICATION_ACTIVATE_IGNORING_OTHER_APPS];
+                if lsopen_status == 0 {
+                    return Ok(());
+                }
+                if !activated {
+                    return Err(format!("failed to activate {app_name}"));
+                }
+                return Err(format!(
+                    "failed to reopen {app_name}: AppleEvent error {reopen_status}; LSOpenCFURLRef error {lsopen_status}"
+                ));
             }
         }
 
-        let name = cf_string_create(app_name);
-        let launched: bool = msg_send![workspace, launchApplication: name];
-        CFRelease(name as CFTypeRef);
+        let launched = launch_workspace_application(workspace, app_name);
         launched
             .then_some(())
             .ok_or_else(|| format!("failed to launch {app_name}"))
     }
+}
+
+fn running_application_has_usable_windows(pid: pid_t, app_name: &str) -> bool {
+    let mut applications = HashMap::new();
+    applications.insert(pid, app_name.to_string());
+    collect_ax_windows(&applications)
+        .values()
+        .any(is_usable_ax_window)
+}
+
+fn is_usable_ax_window(ax: &AxInfo) -> bool {
+    is_compatible_ax_window(ax) && !ax.minimized.unwrap_or(false)
+}
+
+unsafe fn launch_workspace_application(workspace: *mut Object, app_name: &str) -> bool {
+    let name = cf_string_create(app_name);
+    let launched: bool = unsafe { msg_send![workspace, launchApplication: name] };
+    unsafe { CFRelease(name as CFTypeRef) };
+    launched
+}
+
+unsafe fn launch_running_application_url(
+    workspace: *mut Object,
+    application: *mut Object,
+) -> OSStatus {
+    let bundle_identifier: *mut Object = unsafe { msg_send![application, bundleIdentifier] };
+    if bundle_identifier.is_null() {
+        return -1;
+    }
+
+    let url: *mut Object =
+        unsafe { msg_send![workspace, URLForApplicationWithBundleIdentifier: bundle_identifier] };
+    if url.is_null() {
+        return -1;
+    }
+
+    unsafe { LSOpenCFURLRef(url as CFTypeRef, std::ptr::null_mut()) }
+}
+
+unsafe fn send_reopen_application(pid: pid_t) -> OSStatus {
+    let mut target = AEDesc {
+        descriptor_type: 0,
+        data_handle: std::ptr::null_mut(),
+    };
+    let status = unsafe {
+        AECreateDesc(
+            TYPE_KERNEL_PROCESS_ID,
+            &pid as *const pid_t as *const c_void,
+            std::mem::size_of_val(&pid) as Size,
+            &mut target,
+        )
+    };
+    if status != 0 {
+        return status;
+    }
+
+    let mut event = AEDesc {
+        descriptor_type: 0,
+        data_handle: std::ptr::null_mut(),
+    };
+    let status = unsafe {
+        AECreateAppleEvent(
+            K_CORE_EVENT_CLASS,
+            K_AE_REOPEN_APPLICATION,
+            &target,
+            K_AUTO_GENERATE_RETURN_ID,
+            K_ANY_TRANSACTION_ID,
+            &mut event,
+        )
+    };
+    if status != 0 {
+        unsafe { AEDisposeDesc(&mut target) };
+        return status;
+    }
+
+    let status = unsafe {
+        AESendMessage(
+            &event,
+            std::ptr::null_mut(),
+            K_AE_NO_REPLY,
+            K_AE_DEFAULT_TIMEOUT,
+        )
+    };
+    unsafe { AEDisposeDesc(&mut event) };
+    unsafe { AEDisposeDesc(&mut target) };
+    status
 }
 
 fn app_name_matches(running_name: &str, requested_name: &str) -> bool {
@@ -1597,6 +1757,27 @@ mod tests {
         assert!(app_name_matches("Finder", "Finder"));
         assert!(app_name_matches("Finder", "finder"));
         assert!(!app_name_matches("System Settings", "Settings"));
+    }
+
+    #[test]
+    fn usable_ax_windows_require_compatible_non_minimized_window() {
+        let mut standard = test_ax_info(42, "Edge", "AXStandardWindow");
+        assert!(is_usable_ax_window(&standard));
+
+        standard.minimized = Some(true);
+        assert!(!is_usable_ax_window(&standard));
+        assert!(!is_usable_ax_window(&test_ax_info(
+            42,
+            "Edge",
+            "AXSystemDialog"
+        )));
+    }
+
+    #[test]
+    fn fourcc_uses_big_endian_values() {
+        assert_eq!(fourcc(*b"kpid"), 0x6b706964);
+        assert_eq!(fourcc(*b"aevt"), 0x61657674);
+        assert_eq!(fourcc(*b"rapp"), 0x72617070);
     }
 
     #[test]
