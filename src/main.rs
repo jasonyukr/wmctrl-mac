@@ -36,6 +36,7 @@ type AEEventID = OSType;
 type AEReturnID = i16;
 type AETransactionID = i32;
 type AESendMode = i32;
+type OptionBits = u32;
 type Size = libc::c_long;
 type AEAddressDesc = AEDesc;
 type AppleEvent = AEDesc;
@@ -44,6 +45,12 @@ type AppleEvent = AEDesc;
 struct AEDesc {
     descriptor_type: DescType,
     data_handle: *mut c_void,
+}
+
+#[repr(C)]
+struct ProcessSerialNumber {
+    high_long_of_psn: u32,
+    low_long_of_psn: u32,
 }
 
 const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: c_uint = 16;
@@ -57,6 +64,7 @@ const K_AUTO_GENERATE_RETURN_ID: AEReturnID = -1;
 const K_ANY_TRANSACTION_ID: AETransactionID = 0;
 const K_AE_NO_REPLY: AESendMode = 1;
 const K_AE_DEFAULT_TIMEOUT: libc::c_long = -1;
+const K_SET_FRONT_PROCESS_FRONT_WINDOW_ONLY: OptionBits = 1 << 0;
 
 const fn fourcc(value: [u8; 4]) -> OSType {
     u32::from_be_bytes(value)
@@ -117,6 +125,11 @@ unsafe extern "C" {
         time_out_in_ticks: libc::c_long,
     ) -> OSStatus;
     fn AEDisposeDesc(desc: *mut AEDesc) -> OSStatus;
+    fn GetProcessForPID(pid: pid_t, psn: *mut ProcessSerialNumber) -> OSStatus;
+    fn SetFrontProcessWithOptions(
+        process: *const ProcessSerialNumber,
+        options: OptionBits,
+    ) -> OSStatus;
 }
 
 #[link(name = "CoreServices", kind = "framework")]
@@ -148,12 +161,33 @@ enum FocusDirection {
     Prev,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 struct Frame {
     x: f64,
     y: f64,
     w: f64,
     h: f64,
+}
+
+impl Frame {
+    fn intersects(self, other: Self) -> bool {
+        let x_overlap = self.x.max(other.x) < (self.x + self.w).min(other.x + other.w);
+        let y_overlap = self.y.max(other.y) < (self.y + self.h).min(other.y + other.h);
+        x_overlap && y_overlap
+    }
+
+    fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let max_x = (self.x + self.w).max(other.x + other.w);
+        let max_y = (self.y + self.h).max(other.y + other.h);
+        Self {
+            x,
+            y,
+            w: max_x - x,
+            h: max_y - y,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -486,39 +520,77 @@ fn send_focused_window_to_back() -> Result<(), String> {
     ensure_ax_trusted()?;
     let raw_windows = focus_raw_windows()?;
     let ax_windows = collect_focus_ax_windows(&raw_window_applications(&raw_windows));
-    for id in send_to_back_raise_order(&raw_windows, &ax_windows, focused_window) {
-        if let Some(ax) = ax_windows.get(&id) {
-            raise_ax_window(ax)?;
-        }
+    let focus_order = send_to_back_focus_order(&raw_windows, &ax_windows, focused_window);
+    let Some((top_window, _)) = focus_order.split_last() else {
+        return Ok(());
+    };
+    for id in &focus_order {
+        let ax = ax_windows.get(id).ok_or_else(|| {
+            "unable to resolve AX window; grant Accessibility permission or focus the window's space".to_string()
+        })?;
+        focus_ax_window_for_send_to_back(ax)?;
+        std::thread::sleep(std::time::Duration::from_millis(80));
     }
+    let ax = ax_windows.get(top_window).ok_or_else(|| {
+        "unable to resolve AX window; grant Accessibility permission or focus the window's space".to_string()
+    })?;
+    focus_ax_window_for_send_to_back(ax)?;
     Ok(())
 }
 
-fn send_to_back_raise_order(
+struct SendToBackCandidate {
+    id: CGWindowID,
+    frame: Frame,
+}
+
+fn send_to_back_focus_order(
     raw_windows: &[RawWindow],
     ax_windows: &HashMap<CGWindowID, AxInfo>,
     focused_window: CGWindowID,
 ) -> Vec<CGWindowID> {
-    let visible_ids = raw_windows
+    let Some(mut frame) = raw_windows
         .iter()
-        .map(|raw| raw.id as CGWindowID)
-        .collect::<HashSet<_>>();
-    let mut ids = raw_windows
+        .find(|raw| raw.id as CGWindowID == focused_window)
+        .map(|raw| raw.frame)
+    else {
+        return Vec::new();
+    };
+    let candidates = raw_windows
         .iter()
-        .rev()
-        .map(|raw| raw.id as CGWindowID)
-        .filter(|id| *id != focused_window)
-        .filter(|id| ax_windows.get(id).is_some_and(is_compatible_ax_window))
+        .filter(|raw| raw.is_visible)
+        .filter(|raw| raw.id as CGWindowID != focused_window)
+        .filter_map(|raw| {
+            let id = raw.id as CGWindowID;
+            ax_windows
+                .get(&id)
+                .is_some_and(is_send_to_back_compatible_ax_window)
+                .then_some(SendToBackCandidate {
+                    id,
+                    frame: raw.frame,
+                })
+        })
         .collect::<Vec<_>>();
-    ids.extend(
-        sorted_ax_windows(ax_windows)
-            .into_iter()
-            .filter(|(id, ax)| {
-                *id != focused_window && !visible_ids.contains(id) && is_compatible_ax_window(ax)
-            })
-            .map(|(id, _)| id),
-    );
-    ids
+    let mut selected_ids = HashSet::new();
+
+    loop {
+        let mut found = false;
+        for candidate in candidates.iter().rev() {
+            if !selected_ids.contains(&candidate.id) && frame.intersects(candidate.frame) {
+                selected_ids.insert(candidate.id);
+                frame = frame.union(candidate.frame);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return candidates
+                .iter()
+                .rev()
+                .filter(|candidate| selected_ids.contains(&candidate.id))
+                .map(|candidate| candidate.id)
+                .collect();
+        }
+    }
 }
 
 fn select_adjacent_window(windows: &[FocusCandidate], direction: FocusDirection) -> Option<i32> {
@@ -761,13 +833,41 @@ fn focus_ax_window(ax: &AxInfo) -> Result<(), String> {
     Ok(())
 }
 
-fn raise_ax_window(ax: &AxInfo) -> Result<(), String> {
+fn focus_ax_window_for_send_to_back(ax: &AxInfo) -> Result<(), String> {
+    set_ax_main(ax)?;
+    bring_process_front_window_only(ax.pid)?;
+    if ax.app == "Finder" {
+        set_ax_main(ax)?;
+    }
+    Ok(())
+}
+
+fn set_ax_main(ax: &AxInfo) -> Result<(), String> {
     unsafe {
-        let raise_action = cf_string_create("AXRaise");
-        let result = AXUIElementPerformAction(ax.element, raise_action);
-        CFRelease(raise_action as CFTypeRef);
+        let main_attribute = cf_string_create("AXMain");
+        let result =
+            AXUIElementSetAttributeValue(ax.element, main_attribute, kCFBooleanTrue as CFTypeRef);
+        CFRelease(main_attribute as CFTypeRef);
         if result != K_AX_ERROR_SUCCESS {
-            return Err("unable to raise AX window; check Accessibility permission".to_string());
+            return Err(
+                "unable to make AX window main; check Accessibility permission".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn bring_process_front_window_only(pid: pid_t) -> Result<(), String> {
+    unsafe {
+        let mut psn = ProcessSerialNumber {
+            high_long_of_psn: 0,
+            low_long_of_psn: 0,
+        };
+        if GetProcessForPID(pid, &mut psn) != 0 {
+            return Err("unable to resolve process serial number".to_string());
+        }
+        if SetFrontProcessWithOptions(&psn, K_SET_FRONT_PROCESS_FRONT_WINDOW_ONLY) != 0 {
+            return Err("unable to bring process front window forward".to_string());
         }
     }
     Ok(())
@@ -838,6 +938,13 @@ fn is_compatible_ax_window(ax: &AxInfo) -> bool {
             .subrole
             .as_deref()
             .is_none_or(|subrole| subrole == "AXStandardWindow")
+}
+
+fn is_send_to_back_compatible_ax_window(ax: &AxInfo) -> bool {
+    ax.role.as_deref().is_none_or(|role| role == "AXWindow")
+        && ax.subrole.as_deref().is_none_or(|subrole| {
+            matches!(subrole, "AXStandardWindow" | "AXDialog" | "AXSystemDialog")
+        })
 }
 
 fn raw_window_applications(raw_windows: &[RawWindow]) -> HashMap<pid_t, String> {
@@ -1946,23 +2053,55 @@ mod tests {
     }
 
     #[test]
-    fn send_to_back_raise_order_uses_reverse_cg_order_then_ax_only() {
+    fn send_to_back_focus_order_uses_overlap_chain_back_to_front() {
         let raw_windows = vec![
-            test_raw_window(1, "App", true),
-            test_raw_window(2, "App", true),
-            test_raw_window(3, "Other", true),
+            test_raw_window_with_frame(1, "kitty", true, test_frame(0.0, 0.0, 100.0, 100.0)),
+            test_raw_window_with_frame(2, "Edge", true, test_frame(50.0, 0.0, 100.0, 100.0)),
+            test_raw_window_with_frame(3, "kitty", true, test_frame(125.0, 0.0, 100.0, 100.0)),
+            test_raw_window_with_frame(4, "Notes", true, test_frame(400.0, 0.0, 100.0, 100.0)),
         ];
         let ax_windows = HashMap::from([
-            (1, test_ax_info(8, "App", "AXStandardWindow")),
-            (2, test_ax_info(8, "App", "AXStandardWindow")),
-            (3, test_ax_info(9, "Other", "AXSystemDialog")),
-            (4, test_ax_info(10, "Third", "AXStandardWindow")),
+            (1, test_ax_info(8, "kitty", "AXStandardWindow")),
+            (2, test_ax_info(9, "Edge", "AXStandardWindow")),
+            (3, test_ax_info(8, "kitty", "AXStandardWindow")),
+            (4, test_ax_info(10, "Notes", "AXStandardWindow")),
         ]);
 
         assert_eq!(
-            send_to_back_raise_order(&raw_windows, &ax_windows, 1),
-            vec![2, 4]
+            send_to_back_focus_order(&raw_windows, &ax_windows, 1),
+            vec![3, 2]
         );
+    }
+
+    #[test]
+    fn send_to_back_focus_order_ignores_non_overlapping_windows() {
+        let raw_windows = vec![
+            test_raw_window_with_frame(1, "kitty", true, test_frame(0.0, 0.0, 100.0, 100.0)),
+            test_raw_window_with_frame(2, "Edge", true, test_frame(200.0, 0.0, 100.0, 100.0)),
+        ];
+        let ax_windows = HashMap::from([
+            (1, test_ax_info(8, "kitty", "AXStandardWindow")),
+            (2, test_ax_info(9, "Edge", "AXStandardWindow")),
+        ]);
+
+        assert!(send_to_back_focus_order(&raw_windows, &ax_windows, 1).is_empty());
+    }
+
+    #[test]
+    fn send_to_back_compatibility_includes_dialogs() {
+        assert!(is_send_to_back_compatible_ax_window(&test_ax_info(
+            8,
+            "App",
+            "AXStandardWindow"
+        )));
+        assert!(is_send_to_back_compatible_ax_window(&test_ax_info(
+            8, "App", "AXDialog"
+        )));
+        assert!(is_send_to_back_compatible_ax_window(&test_ax_info(
+            8,
+            "App",
+            "AXSystemDialog"
+        )));
     }
 
     #[test]
@@ -2217,21 +2356,24 @@ mod tests {
     }
 
     fn test_raw_window(id: i32, app: &str, is_visible: bool) -> RawWindow {
+        test_raw_window_with_frame(id, app, is_visible, test_frame(1.0, 2.0, 3.0, 4.0))
+    }
+
+    fn test_raw_window_with_frame(id: i32, app: &str, is_visible: bool, frame: Frame) -> RawWindow {
         RawWindow {
             id,
             pid: 8,
             app: app.to_string(),
             title: "Title".to_string(),
-            frame: Frame {
-                x: 1.0,
-                y: 2.0,
-                w: 3.0,
-                h: 4.0,
-            },
+            frame,
             level: 0,
             opacity: 1.0,
             is_visible,
         }
+    }
+
+    fn test_frame(x: f64, y: f64, w: f64, h: f64) -> Frame {
+        Frame { x, y, w, h }
     }
 
     fn test_ax_info(pid: pid_t, app: &str, subrole: &str) -> AxInfo {
