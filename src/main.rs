@@ -185,6 +185,13 @@ struct AxInfo {
     minimized: Option<bool>,
 }
 
+struct FocusCandidate {
+    id: i32,
+    space: i32,
+    app: String,
+    has_focus: bool,
+}
+
 impl Drop for AxInfo {
     fn drop(&mut self) {
         if !self.element.is_null() {
@@ -339,39 +346,39 @@ fn listwnd_lines(windows: &[Window], sort: bool, space: Option<i32>) -> Vec<Stri
 }
 
 fn focus_other_window(direction: FocusDirection) -> Result<(), String> {
-    let raw_windows = cg_windows()?;
-    let ax_windows = collect_ax_windows(&raw_window_applications(&raw_windows));
+    ensure_ax_trusted()?;
+    let raw_windows = focus_raw_windows()?;
+    let ax_windows = collect_focus_ax_windows(&raw_window_applications(&raw_windows));
     let focused_window = focused_window_id();
-    let windows = compatible_windows(raw_windows, &ax_windows, focused_window);
-    let focus_target = select_other_window(&windows, direction)?;
+    let focus_candidates = focus_candidates(raw_windows, &ax_windows, focused_window);
+    let focus_target = select_other_window(&focus_candidates, direction)?;
     if let Some(id) = focus_target {
         let ax = ax_windows.get(&(id as CGWindowID)).ok_or_else(|| {
             "unable to resolve AX window; grant Accessibility permission or focus the window's space".to_string()
         })?;
-        ensure_ax_trusted()?;
         focus_ax_window(ax)?;
     }
     Ok(())
 }
 
 fn focus_adjacent_window(direction: FocusDirection) -> Result<(), String> {
-    let raw_windows = cg_windows()?;
-    let ax_windows = collect_ax_windows(&raw_window_applications(&raw_windows));
+    ensure_ax_trusted()?;
+    let raw_windows = focus_raw_windows()?;
+    let ax_windows = collect_focus_ax_windows(&raw_window_applications(&raw_windows));
     let focused_window = focused_window_id();
-    let windows = compatible_windows(raw_windows, &ax_windows, focused_window);
-    let focus_target = select_adjacent_window(&windows, direction);
+    let focus_candidates = focus_candidates(raw_windows, &ax_windows, focused_window);
+    let focus_target = select_adjacent_window(&focus_candidates, direction);
     if let Some(id) = focus_target {
         let ax = ax_windows.get(&(id as CGWindowID)).ok_or_else(|| {
             "unable to resolve AX window; grant Accessibility permission or focus the window's space".to_string()
         })?;
-        ensure_ax_trusted()?;
         focus_ax_window(ax)?;
     }
     Ok(())
 }
 
-fn select_adjacent_window(windows: &[Window], direction: FocusDirection) -> Option<i32> {
-    let (qlines, focused) = focus_other_qlines(windows)?;
+fn select_adjacent_window(windows: &[FocusCandidate], direction: FocusDirection) -> Option<i32> {
+    let (qlines, focused) = focus_qlines(windows)?;
     let list = qlines
         .iter()
         .filter(|window| window.space == focused.space && window.app == focused.app)
@@ -387,11 +394,58 @@ fn select_adjacent_window(windows: &[Window], direction: FocusDirection) -> Opti
     }
 }
 
+fn focus_candidates(
+    raw_windows: Vec<RawWindow>,
+    ax_windows: &HashMap<CGWindowID, AxInfo>,
+    focused_window: Option<CGWindowID>,
+) -> Vec<FocusCandidate> {
+    let mut visible_window_ids = HashSet::new();
+    let mut candidates = Vec::new();
+
+    for raw in raw_windows {
+        let id = raw.id as CGWindowID;
+        let Some(ax) = ax_windows.get(&id) else {
+            continue;
+        };
+        if !is_compatible_ax_window(ax) {
+            continue;
+        }
+        visible_window_ids.insert(id);
+        candidates.push(FocusCandidate {
+            id: raw.id,
+            space: 1,
+            app: if raw.app.is_empty() {
+                ax.app.clone()
+            } else {
+                raw.app
+            },
+            has_focus: focused_window == Some(id),
+        });
+    }
+
+    candidates.extend(
+        ax_windows
+            .iter()
+            .map(|(id, ax)| (*id, ax))
+            .filter(|(id, _)| !visible_window_ids.contains(id))
+            .filter(|(_, ax)| is_compatible_ax_window(ax))
+            .map(|(id, ax)| FocusCandidate {
+                id: id as i32,
+                space: 1,
+                app: ax.app.clone(),
+                has_focus: focused_window == Some(id),
+            }),
+    );
+
+    candidates.sort_by_key(|window| window.id);
+    candidates
+}
+
 fn select_other_window(
-    windows: &[Window],
+    windows: &[FocusCandidate],
     direction: FocusDirection,
 ) -> Result<Option<i32>, String> {
-    let Some((qlines, focused)) = focus_other_qlines(windows) else {
+    let Some((qlines, focused)) = focus_qlines(windows) else {
         return Ok(None);
     };
 
@@ -408,11 +462,8 @@ fn select_other_window(
     ))
 }
 
-fn focus_other_qlines(windows: &[Window]) -> Option<(Vec<&Window>, &Window)> {
-    let mut qlines = windows
-        .iter()
-        .filter(|window| window.has_ax_reference)
-        .collect::<Vec<_>>();
+fn focus_qlines(windows: &[FocusCandidate]) -> Option<(Vec<&FocusCandidate>, &FocusCandidate)> {
+    let mut qlines = windows.iter().collect::<Vec<_>>();
     qlines.sort_by_key(|window| window.id);
     if qlines.is_empty() {
         return None;
@@ -426,8 +477,8 @@ fn focus_other_qlines(windows: &[Window]) -> Option<(Vec<&Window>, &Window)> {
 }
 
 fn select_representative_window(
-    qlines: &[&Window],
-    focused: &Window,
+    qlines: &[&FocusCandidate],
+    focused: &FocusCandidate,
     remembered: &HashMap<String, i32>,
     direction: FocusDirection,
 ) -> Option<i32> {
@@ -822,7 +873,61 @@ fn cg_windows() -> Result<Vec<RawWindow>, String> {
     }
 }
 
+fn focus_raw_windows() -> Result<Vec<RawWindow>, String> {
+    unsafe {
+        let options = K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS;
+        let list = CGWindowListCopyWindowInfo(options, K_CG_NULL_WINDOW_ID);
+        if list.is_null() {
+            return Err("unable to enumerate windows".to_string());
+        }
+
+        let mut windows = Vec::new();
+        for index in 0..CFArrayGetCount(list) {
+            let dictionary = CFArrayGetValueAtIndex(list, index) as CFDictionaryRef;
+            if dictionary.is_null() {
+                continue;
+            }
+
+            let id = dictionary_i32(dictionary, kCGWindowNumber).unwrap_or(0);
+            let pid = dictionary_i32(dictionary, kCGWindowOwnerPID).unwrap_or(0);
+            let frame = dictionary_frame(dictionary, kCGWindowBounds).unwrap_or(Frame {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            });
+            if id == 0 || pid == 0 || frame.w <= 0.0 || frame.h <= 0.0 {
+                continue;
+            }
+
+            windows.push(RawWindow {
+                id,
+                pid,
+                app: dictionary_string(dictionary, kCGWindowOwnerName).unwrap_or_default(),
+                title: String::new(),
+                frame,
+                level: 0,
+                opacity: 1.0,
+                is_visible: true,
+            });
+        }
+        CFRelease(list as CFTypeRef);
+        Ok(windows)
+    }
+}
+
 fn collect_ax_windows(applications: &HashMap<pid_t, String>) -> HashMap<CGWindowID, AxInfo> {
+    collect_ax_windows_with_attributes(applications, true)
+}
+
+fn collect_focus_ax_windows(applications: &HashMap<pid_t, String>) -> HashMap<CGWindowID, AxInfo> {
+    collect_ax_windows_with_attributes(applications, false)
+}
+
+fn collect_ax_windows_with_attributes(
+    applications: &HashMap<pid_t, String>,
+    include_extra_attributes: bool,
+) -> HashMap<CGWindowID, AxInfo> {
     let mut windows = HashMap::new();
     for (pid, app_name) in applications {
         unsafe {
@@ -850,8 +955,12 @@ fn collect_ax_windows(applications: &HashMap<pid_t, String>) -> HashMap<CGWindow
                     element: retain_ax_element(element),
                     role: copy_ax_string_named(element, "AXRole"),
                     subrole: copy_ax_string_named(element, "AXSubrole"),
-                    title: copy_ax_string_named(element, "AXTitle"),
-                    minimized: copy_ax_bool_named(element, "AXMinimized"),
+                    title: include_extra_attributes
+                        .then(|| copy_ax_string_named(element, "AXTitle"))
+                        .flatten(),
+                    minimized: include_extra_attributes
+                        .then(|| copy_ax_bool_named(element, "AXMinimized"))
+                        .flatten(),
                 });
             }
 
@@ -1355,10 +1464,10 @@ mod tests {
     #[test]
     fn focus_adjacent_window_wraps_same_app_next_and_prev() {
         let windows = vec![
-            test_window(1, "App", false),
-            test_window(2, "App", true),
-            test_window(3, "App", false),
-            test_window(4, "Other", false),
+            test_focus_candidate(1, "App", false),
+            test_focus_candidate(2, "App", true),
+            test_focus_candidate(3, "App", false),
+            test_focus_candidate(4, "Other", false),
         ];
 
         assert_eq!(
@@ -1371,9 +1480,9 @@ mod tests {
         );
 
         let windows = vec![
-            test_window(1, "App", true),
-            test_window(2, "App", false),
-            test_window(3, "Other", false),
+            test_focus_candidate(1, "App", true),
+            test_focus_candidate(2, "App", false),
+            test_focus_candidate(3, "Other", false),
         ];
 
         assert_eq!(
@@ -1383,12 +1492,12 @@ mod tests {
     }
 
     #[test]
-    fn focus_adjacent_window_uses_current_space_and_keeps_deskflow() {
-        let focused = test_window(1, "Deskflow", true);
-        let other_deskflow = test_window(2, "Deskflow", false);
-        let mut other_space = test_window(3, "Deskflow", false);
+    fn focus_adjacent_window_uses_current_space() {
+        let focused = test_focus_candidate(1, "App", true);
+        let other_app = test_focus_candidate(2, "App", false);
+        let mut other_space = test_focus_candidate(3, "App", false);
         other_space.space = 2;
-        let windows = vec![focused, other_deskflow, other_space];
+        let windows = vec![focused, other_app, other_space];
 
         assert_eq!(
             select_adjacent_window(&windows, FocusDirection::Next),
@@ -1397,13 +1506,33 @@ mod tests {
     }
 
     #[test]
+    fn focus_candidates_include_ax_only_windows() {
+        let raw_windows = vec![test_raw_window(2, "App", true)];
+        let ax_windows = HashMap::from([
+            (1, test_ax_info(8, "Other", "AXStandardWindow")),
+            (2, test_ax_info(8, "App", "AXStandardWindow")),
+        ]);
+
+        let candidates = focus_candidates(raw_windows, &ax_windows, Some(2));
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|window| window.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(candidates[1].has_focus);
+    }
+
+    #[test]
     fn focus_other_window_wraps_next_and_prev() {
         let windows = vec![
-            test_window(1, "App", true),
-            test_window(2, "Other", false),
-            test_window(3, "Third", false),
+            test_focus_candidate(1, "App", true),
+            test_focus_candidate(2, "Other", false),
+            test_focus_candidate(3, "Third", false),
         ];
-        let (qlines, focused) = focus_other_qlines(&windows).unwrap();
+        let (qlines, focused) = focus_qlines(&windows).unwrap();
         let remembered = HashMap::new();
 
         assert_eq!(
@@ -1412,11 +1541,11 @@ mod tests {
         );
 
         let windows = vec![
-            test_window(1, "App", false),
-            test_window(2, "Other", false),
-            test_window(3, "Third", true),
+            test_focus_candidate(1, "App", false),
+            test_focus_candidate(2, "Other", false),
+            test_focus_candidate(3, "Third", true),
         ];
-        let (qlines, focused) = focus_other_qlines(&windows).unwrap();
+        let (qlines, focused) = focus_qlines(&windows).unwrap();
 
         assert_eq!(
             select_representative_window(&qlines, focused, &remembered, FocusDirection::Next),
@@ -1427,12 +1556,12 @@ mod tests {
     #[test]
     fn focus_other_window_uses_one_representative_per_app() {
         let windows = vec![
-            test_window(1, "App", true),
-            test_window(2, "Other", false),
-            test_window(3, "Other", false),
-            test_window(4, "Third", false),
+            test_focus_candidate(1, "App", true),
+            test_focus_candidate(2, "Other", false),
+            test_focus_candidate(3, "Other", false),
+            test_focus_candidate(4, "Third", false),
         ];
-        let (qlines, focused) = focus_other_qlines(&windows).unwrap();
+        let (qlines, focused) = focus_qlines(&windows).unwrap();
 
         assert_eq!(
             select_representative_window(&qlines, focused, &HashMap::new(), FocusDirection::Next),
@@ -1447,11 +1576,11 @@ mod tests {
     #[test]
     fn focus_other_window_uses_remembered_window_on_same_desktop() {
         let windows = vec![
-            test_window(1, "App", true),
-            test_window(2, "Other", false),
-            test_window(3, "Other", false),
+            test_focus_candidate(1, "App", true),
+            test_focus_candidate(2, "Other", false),
+            test_focus_candidate(3, "Other", false),
         ];
-        let (qlines, focused) = focus_other_qlines(&windows).unwrap();
+        let (qlines, focused) = focus_qlines(&windows).unwrap();
         let remembered = HashMap::from([("Other".to_string(), 3)]);
 
         assert_eq!(
@@ -1463,11 +1592,11 @@ mod tests {
     #[test]
     fn focus_other_window_ignores_other_same_app_windows() {
         let windows = vec![
-            test_window(1, "App", true),
-            test_window(2, "App", false),
-            test_window(3, "Other", false),
+            test_focus_candidate(1, "App", true),
+            test_focus_candidate(2, "App", false),
+            test_focus_candidate(3, "Other", false),
         ];
-        let (qlines, focused) = focus_other_qlines(&windows).unwrap();
+        let (qlines, focused) = focus_qlines(&windows).unwrap();
 
         assert_eq!(
             select_representative_window(&qlines, focused, &HashMap::new(), FocusDirection::Next),
@@ -1480,15 +1609,12 @@ mod tests {
     }
 
     #[test]
-    fn focus_other_window_keeps_ax_deskflow_and_excludes_non_ax() {
-        let mut deskflow = test_window(1, "Deskflow", false);
-        let mut non_ax = test_window(2, "Other", false);
-        let focused = test_window(3, "App", true);
-        deskflow.has_ax_reference = true;
-        non_ax.has_ax_reference = false;
+    fn focus_other_window_keeps_ax_candidates() {
+        let other = test_focus_candidate(1, "Other", false);
+        let focused = test_focus_candidate(3, "App", true);
 
-        let windows = [deskflow, non_ax, focused];
-        let (qlines, focused) = focus_other_qlines(&windows).unwrap();
+        let windows = [other, focused];
+        let (qlines, focused) = focus_qlines(&windows).unwrap();
 
         assert_eq!(
             qlines.iter().map(|window| window.id).collect::<Vec<_>>(),
@@ -1499,9 +1625,12 @@ mod tests {
 
     #[test]
     fn focus_other_window_no_focused_row_is_noop() {
-        let windows = vec![test_window(1, "App", false), test_window(2, "Other", false)];
+        let windows = vec![
+            test_focus_candidate(1, "App", false),
+            test_focus_candidate(2, "Other", false),
+        ];
 
-        assert!(focus_other_qlines(&windows).is_none());
+        assert!(focus_qlines(&windows).is_none());
     }
 
     #[test]
@@ -1614,6 +1743,15 @@ mod tests {
             test_raw_window(id, app, true).into_window(None, has_focus.then_some(id as CGWindowID));
         window.has_ax_reference = true;
         window
+    }
+
+    fn test_focus_candidate(id: i32, app: &str, has_focus: bool) -> FocusCandidate {
+        FocusCandidate {
+            id,
+            space: 1,
+            app: app.to_string(),
+            has_focus,
+        }
     }
 
     fn test_raw_window(id: i32, app: &str, is_visible: bool) -> RawWindow {

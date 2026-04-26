@@ -9,6 +9,8 @@ Compact `yabai` shim for scripts that only need a small query/focus subset on ma
 - `wmctrl-mac -m query --windows --space <index>`
 - `wmctrl-mac -m window --focus <id>`
 - `wmctrl-mac -m listwnd [-s] [space]`
+- `wmctrl-mac -m focus-next-window`
+- `wmctrl-mac -m focus-prev-window`
 - `wmctrl-mac -m focus-other-next-window`
 - `wmctrl-mac -m focus-other-prev-window`
 
@@ -33,6 +35,8 @@ Install or copy `target/release/wmctrl-mac` to the path your scripts call.
 ## Accessibility permission
 
 `wmctrl-mac -m window --focus <id>` uses macOS Accessibility APIs. On first focus attempt, macOS may prompt for permission; approve the final installed `wmctrl-mac` binary in System Settings > Privacy & Security > Accessibility.
+
+`wmctrl-mac -m focus-next-window` and `wmctrl-mac -m focus-prev-window` cycle focus between windows from the currently focused app on the focused space.
 
 `wmctrl-mac -m focus-other-next-window` and `wmctrl-mac -m focus-other-prev-window` cycle focus between one representative window per app on the focused space, remembering the last focused window for each app in `${TMPDIR:-/tmp}`.
 
