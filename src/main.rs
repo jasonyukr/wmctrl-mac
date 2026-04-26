@@ -74,13 +74,17 @@ unsafe extern "C" {}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
+    Help,
     QuerySpaces,
     QueryWindows { space: Option<i32> },
     ListWnd { sort: bool, space: Option<i32> },
     FocusWindow { id: CGWindowID },
     FocusAdjacentWindow { direction: FocusDirection },
     FocusOtherWindow { direction: FocusDirection },
+    LaunchOrFocus { app_name: String },
 }
+
+const HELP: &str = "Usage:\n  wmctrl-mac --help\n  wmctrl-mac -h\n  wmctrl-mac -m query --spaces\n  wmctrl-mac -m query --windows\n  wmctrl-mac -m query --windows --space <index>\n  wmctrl-mac -m window --focus <id>\n  wmctrl-mac -m listwnd [-s] [space]\n  wmctrl-mac listwnd [-s] [space]\n  wmctrl-mac -m focus-next-window\n  wmctrl-mac -m focus-prev-window\n  wmctrl-mac -m focus-other-next-window\n  wmctrl-mac -m focus-other-prev-window\n  wmctrl-mac -m launch-or-focus <app name>";
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum FocusDirection {
@@ -214,6 +218,10 @@ fn main() {
 
 fn run(args: Vec<String>) -> Result<(), String> {
     match parse_command(&args)? {
+        Command::Help => {
+            println!("{HELP}");
+            Ok(())
+        }
         Command::QuerySpaces => {
             let windows = query_windows()?;
             print_json(&vec![focused_space(
@@ -232,11 +240,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Command::FocusWindow { id } => focus_window(id),
         Command::FocusAdjacentWindow { direction } => focus_adjacent_window(direction),
         Command::FocusOtherWindow { direction } => focus_other_window(direction),
+        Command::LaunchOrFocus { app_name } => launch_or_focus_application(&app_name),
     }
 }
 
 fn parse_command(args: &[String]) -> Result<Command, String> {
     match args {
+        [command] if command == "--help" || command == "-h" => Ok(Command::Help),
         [mode, query, target] if mode == "-m" && query == "query" && target == "--spaces" => {
             Ok(Command::QuerySpaces)
         }
@@ -245,6 +255,9 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }
         [mode, command, args @ ..] if mode == "-m" && command == "listwnd" => {
             parse_listwnd_command(args)
+        }
+        [mode, command, args @ ..] if mode == "-m" && command == "launch-or-focus" => {
+            parse_launch_or_focus_command(args)
         }
         [mode, command] if mode == "-m" && command == "focus-other-next-window" => {
             Ok(Command::FocusOtherWindow {
@@ -286,6 +299,14 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }
         _ => Err("unsupported command".to_string()),
     }
+}
+
+fn parse_launch_or_focus_command(args: &[String]) -> Result<Command, String> {
+    let app_name = args.join(" ");
+    if app_name.trim().is_empty() {
+        return Err("launch-or-focus requires an app name".to_string());
+    }
+    Ok(Command::LaunchOrFocus { app_name })
 }
 
 fn parse_listwnd_command(args: &[String]) -> Result<Command, String> {
@@ -1064,6 +1085,55 @@ fn running_applications() -> HashMap<pid_t, String> {
     }
 }
 
+fn launch_or_focus_application(app_name: &str) -> Result<(), String> {
+    if app_name.contains('/') {
+        return Err("launch-or-focus only supports application names, not paths".to_string());
+    }
+
+    unsafe {
+        let Some(class) = Class::get("NSWorkspace") else {
+            return Err("NSWorkspace is unavailable".to_string());
+        };
+        let workspace: *mut Object = msg_send![class, sharedWorkspace];
+        if workspace.is_null() {
+            return Err("NSWorkspace is unavailable".to_string());
+        }
+        let applications: *mut Object = msg_send![workspace, runningApplications];
+        if applications.is_null() {
+            return Err("NSWorkspace runningApplications is unavailable".to_string());
+        }
+
+        let count: usize = msg_send![applications, count];
+        for index in 0..count {
+            let application: *mut Object = msg_send![applications, objectAtIndex: index];
+            if application.is_null() {
+                continue;
+            }
+            let name: *mut Object = msg_send![application, localizedName];
+            let Some(name) = cf_string(name as CFStringRef) else {
+                continue;
+            };
+            if app_name_matches(&name, app_name) {
+                let activated: bool = msg_send![application, activateWithOptions: NS_APPLICATION_ACTIVATE_IGNORING_OTHER_APPS];
+                return activated
+                    .then_some(())
+                    .ok_or_else(|| format!("failed to activate {app_name}"));
+            }
+        }
+
+        let name = cf_string_create(app_name);
+        let launched: bool = msg_send![workspace, launchApplication: name];
+        CFRelease(name as CFTypeRef);
+        launched
+            .then_some(())
+            .ok_or_else(|| format!("failed to launch {app_name}"))
+    }
+}
+
+fn app_name_matches(running_name: &str, requested_name: &str) -> bool {
+    running_name == requested_name || running_name.eq_ignore_ascii_case(requested_name)
+}
+
 fn focused_window_id() -> Option<CGWindowID> {
     focused_frontmost_window_id().or_else(focused_system_window_id)
 }
@@ -1299,6 +1369,8 @@ mod tests {
 
     #[test]
     fn parses_supported_commands() {
+        assert_eq!(parse_command(&args(&["--help"])), Ok(Command::Help));
+        assert_eq!(parse_command(&args(&["-h"])), Ok(Command::Help));
         assert_eq!(
             parse_command(&args(&["-m", "query", "--spaces"])),
             Ok(Command::QuerySpaces)
@@ -1409,12 +1481,32 @@ mod tests {
             parse_command(&args(&["-m", "window", "--focus", "42"])),
             Ok(Command::FocusWindow { id: 42 })
         );
+        assert_eq!(
+            parse_command(&args(&["-m", "launch-or-focus", "Finder"])),
+            Ok(Command::LaunchOrFocus {
+                app_name: "Finder".to_string()
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&["-m", "launch-or-focus", "System", "Settings"])),
+            Ok(Command::LaunchOrFocus {
+                app_name: "System Settings".to_string()
+            })
+        );
     }
 
     #[test]
     fn rejects_unsupported_commands() {
         assert_eq!(
             parse_command(&args(&["-m", "query", "--displays"])),
+            Err("unsupported command".to_string())
+        );
+        assert_eq!(
+            parse_command(&args(&["-m", "--help"])),
+            Err("unsupported command".to_string())
+        );
+        assert_eq!(
+            parse_command(&args(&["listwnd", "-h"])),
             Err("unsupported command".to_string())
         );
         assert_eq!(
@@ -1433,6 +1525,17 @@ mod tests {
             parse_command(&args(&["-m", "window", "--focus", "abc"])),
             Err("--focus requires a numeric window id".to_string())
         );
+        assert_eq!(
+            parse_command(&args(&["-m", "launch-or-focus"])),
+            Err("launch-or-focus requires an app name".to_string())
+        );
+    }
+
+    #[test]
+    fn app_name_matches_exact_or_case_insensitive() {
+        assert!(app_name_matches("Finder", "Finder"));
+        assert!(app_name_matches("Finder", "finder"));
+        assert!(!app_name_matches("System Settings", "Settings"));
     }
 
     #[test]
