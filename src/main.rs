@@ -192,6 +192,11 @@ struct FocusCandidate {
     has_focus: bool,
 }
 
+struct FrontmostApplication {
+    pid: pid_t,
+    name: String,
+}
+
 impl Drop for AxInfo {
     fn drop(&mut self) {
         if !self.element.is_null() {
@@ -363,6 +368,24 @@ fn focus_other_window(direction: FocusDirection) -> Result<(), String> {
 
 fn focus_adjacent_window(direction: FocusDirection) -> Result<(), String> {
     ensure_ax_trusted()?;
+    let Some((frontmost, focused_window)) = focused_frontmost_window() else {
+        return focus_adjacent_window_fallback(direction);
+    };
+    let raw_windows = focus_raw_windows_for_pid(frontmost.pid)?;
+    let ax_windows =
+        collect_focus_ax_windows(&frontmost_raw_window_applications(&raw_windows, &frontmost));
+    let focus_candidates = focus_candidates(raw_windows, &ax_windows, Some(focused_window));
+    let focus_target = select_adjacent_window(&focus_candidates, direction);
+    if let Some(id) = focus_target {
+        let ax = ax_windows.get(&(id as CGWindowID)).ok_or_else(|| {
+            "unable to resolve AX window; grant Accessibility permission or focus the window's space".to_string()
+        })?;
+        focus_ax_window(ax)?;
+    }
+    Ok(())
+}
+
+fn focus_adjacent_window_fallback(direction: FocusDirection) -> Result<(), String> {
     let raw_windows = focus_raw_windows()?;
     let ax_windows = collect_focus_ax_windows(&raw_window_applications(&raw_windows));
     let focused_window = focused_window_id();
@@ -699,6 +722,22 @@ fn raw_window_applications(raw_windows: &[RawWindow]) -> HashMap<pid_t, String> 
     applications
 }
 
+fn frontmost_raw_window_applications(
+    raw_windows: &[RawWindow],
+    frontmost: &FrontmostApplication,
+) -> HashMap<pid_t, String> {
+    let mut applications = raw_window_applications(raw_windows);
+    applications
+        .entry(frontmost.pid)
+        .and_modify(|app| {
+            if app.is_empty() {
+                *app = frontmost.name.clone();
+            }
+        })
+        .or_insert_with(|| frontmost.name.clone());
+    applications
+}
+
 fn ensure_ax_trusted() -> Result<(), String> {
     if ax_is_process_trusted(false) {
         Ok(())
@@ -874,6 +913,14 @@ fn cg_windows() -> Result<Vec<RawWindow>, String> {
 }
 
 fn focus_raw_windows() -> Result<Vec<RawWindow>, String> {
+    focus_raw_windows_matching(None)
+}
+
+fn focus_raw_windows_for_pid(pid: pid_t) -> Result<Vec<RawWindow>, String> {
+    focus_raw_windows_matching(Some(pid))
+}
+
+fn focus_raw_windows_matching(pid_filter: Option<pid_t>) -> Result<Vec<RawWindow>, String> {
     unsafe {
         let options = K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS;
         let list = CGWindowListCopyWindowInfo(options, K_CG_NULL_WINDOW_ID);
@@ -890,23 +937,33 @@ fn focus_raw_windows() -> Result<Vec<RawWindow>, String> {
 
             let id = dictionary_i32(dictionary, kCGWindowNumber).unwrap_or(0);
             let pid = dictionary_i32(dictionary, kCGWindowOwnerPID).unwrap_or(0);
+            if id == 0 || pid == 0 || pid_filter.is_some_and(|expected| pid != expected) {
+                continue;
+            }
+
+            let app = dictionary_string(dictionary, kCGWindowOwnerName).unwrap_or_default();
+            let level = dictionary_i32(dictionary, kCGWindowLayer).unwrap_or(0);
+            if !is_focus_raw_window_level(level, &app) {
+                continue;
+            }
+
             let frame = dictionary_frame(dictionary, kCGWindowBounds).unwrap_or(Frame {
                 x: 0.0,
                 y: 0.0,
                 w: 0.0,
                 h: 0.0,
             });
-            if id == 0 || pid == 0 || frame.w <= 0.0 || frame.h <= 0.0 {
+            if frame.w <= 0.0 || frame.h <= 0.0 {
                 continue;
             }
 
             windows.push(RawWindow {
                 id,
                 pid,
-                app: dictionary_string(dictionary, kCGWindowOwnerName).unwrap_or_default(),
+                app,
                 title: String::new(),
                 frame,
-                level: 0,
+                level,
                 opacity: 1.0,
                 is_visible: true,
             });
@@ -914,6 +971,10 @@ fn focus_raw_windows() -> Result<Vec<RawWindow>, String> {
         CFRelease(list as CFTypeRef);
         Ok(windows)
     }
+}
+
+fn is_focus_raw_window_level(level: i32, app: &str) -> bool {
+    level == 0 || !matches!(app, "Control Center" | "Dock" | "SystemUIServer")
 }
 
 fn collect_ax_windows(applications: &HashMap<pid_t, String>) -> HashMap<CGWindowID, AxInfo> {
@@ -1008,6 +1069,23 @@ fn focused_window_id() -> Option<CGWindowID> {
 }
 
 fn focused_frontmost_window_id() -> Option<CGWindowID> {
+    focused_frontmost_window().map(|(_, id)| id)
+}
+
+fn focused_frontmost_window() -> Option<(FrontmostApplication, CGWindowID)> {
+    let frontmost = frontmost_application()?;
+    unsafe {
+        let app = AXUIElementCreateApplication(frontmost.pid);
+        if app.is_null() {
+            return None;
+        }
+        let focused = focused_ax_window_id(app);
+        CFRelease(app as CFTypeRef);
+        focused.map(|id| (frontmost, id))
+    }
+}
+
+fn frontmost_application() -> Option<FrontmostApplication> {
     unsafe {
         let class = Class::get("NSWorkspace")?;
         let workspace: *mut Object = msg_send![class, sharedWorkspace];
@@ -1022,14 +1100,11 @@ fn focused_frontmost_window_id() -> Option<CGWindowID> {
         if pid == 0 {
             return None;
         }
-
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
-            return None;
-        }
-        let focused = focused_ax_window_id(app);
-        CFRelease(app as CFTypeRef);
-        focused
+        let name: *mut Object = msg_send![application, localizedName];
+        Some(FrontmostApplication {
+            pid,
+            name: cf_string(name as CFStringRef).unwrap_or_default(),
+        })
     }
 }
 
@@ -1736,6 +1811,28 @@ mod tests {
         let applications = raw_window_applications(&[first, second]);
 
         assert_eq!(applications, HashMap::from([(10, "Edge".to_string())]));
+    }
+
+    #[test]
+    fn frontmost_raw_window_applications_adds_frontmost_without_raw_window() {
+        let frontmost = FrontmostApplication {
+            pid: 10,
+            name: "Edge".to_string(),
+        };
+
+        let applications = frontmost_raw_window_applications(&[], &frontmost);
+
+        assert_eq!(applications, HashMap::from([(10, "Edge".to_string())]));
+    }
+
+    #[test]
+    fn focus_raw_window_level_skips_only_known_system_overlays() {
+        assert!(is_focus_raw_window_level(0, "Dock"));
+        assert!(is_focus_raw_window_level(24, "Deskflow"));
+        assert!(is_focus_raw_window_level(24, "Edge"));
+        assert!(!is_focus_raw_window_level(24, "Dock"));
+        assert!(!is_focus_raw_window_level(24, "Control Center"));
+        assert!(!is_focus_raw_window_level(24, "SystemUIServer"));
     }
 
     fn test_window(id: i32, app: &str, has_focus: bool) -> Window {
