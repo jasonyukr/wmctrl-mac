@@ -327,10 +327,17 @@ fn listwnd_lines(windows: &[Window], sort: bool, space: Option<i32>) -> Vec<Stri
 }
 
 fn focus_other_window(direction: FocusDirection) -> Result<(), String> {
-    let windows = query_windows()?;
+    let raw_windows = cg_windows()?;
+    let ax_windows = collect_ax_windows(&raw_window_applications(&raw_windows));
+    let focused_window = focused_window_id();
+    let windows = compatible_windows(raw_windows, &ax_windows, focused_window);
     let focus_target = select_other_window(&windows, direction)?;
     if let Some(id) = focus_target {
-        focus_window(id as CGWindowID)?;
+        let ax = ax_windows.get(&(id as CGWindowID)).ok_or_else(|| {
+            "unable to resolve AX window; grant Accessibility permission or focus the window's space".to_string()
+        })?;
+        ensure_ax_trusted()?;
+        focus_ax_window(ax)?;
     }
     Ok(())
 }
@@ -479,7 +486,7 @@ fn query_windows() -> Result<Vec<Window>, String> {
     let ax_windows = collect_ax_windows(&raw_window_applications(&raw_windows));
     let focused_window = focused_window_id();
 
-    Ok(compatible_windows(raw_windows, ax_windows, focused_window))
+    Ok(compatible_windows(raw_windows, &ax_windows, focused_window))
 }
 
 fn focus_window(id: CGWindowID) -> Result<(), String> {
@@ -489,6 +496,10 @@ fn focus_window(id: CGWindowID) -> Result<(), String> {
         "unable to resolve AX window; grant Accessibility permission or focus the window's space".to_string()
     })?;
 
+    focus_ax_window(ax)
+}
+
+fn focus_ax_window(ax: &AxInfo) -> Result<(), String> {
     activate_application(ax.pid);
     unsafe {
         let raise_action = cf_string_create("AXRaise");
@@ -512,23 +523,25 @@ fn focus_window(id: CGWindowID) -> Result<(), String> {
 
 fn compatible_windows(
     raw_windows: Vec<RawWindow>,
-    mut ax_windows: HashMap<CGWindowID, AxInfo>,
+    ax_windows: &HashMap<CGWindowID, AxInfo>,
     focused_window: Option<CGWindowID>,
 ) -> Vec<Window> {
     let mut visible_windows = Vec::new();
     let mut other_windows = Vec::new();
+    let mut visible_window_ids = HashSet::new();
 
     for raw in raw_windows {
         let id = raw.id as CGWindowID;
-        let Some(ax) = ax_windows.remove(&id) else {
+        let Some(ax) = ax_windows.get(&id) else {
             continue;
         };
-        if !is_compatible_ax_window(&ax) {
+        if !is_compatible_ax_window(ax) {
             continue;
         }
+        visible_window_ids.insert(id);
         let window = raw
-            .clone_with_ax_defaults(&ax)
-            .into_window(Some(&ax), focused_window);
+            .clone_with_ax_defaults(ax)
+            .into_window(Some(ax), focused_window);
         if window.is_visible {
             visible_windows.push(window);
         } else {
@@ -539,8 +552,9 @@ fn compatible_windows(
     other_windows.extend(
         sorted_ax_windows(ax_windows)
             .into_iter()
+            .filter(|(id, _)| !visible_window_ids.contains(id))
             .filter(|(_, ax)| is_compatible_ax_window(ax))
-            .map(|(id, ax)| RawWindow::from_ax(id, &ax).into_window(Some(&ax), focused_window)),
+            .map(|(id, ax)| RawWindow::from_ax(id, ax).into_window(Some(ax), focused_window)),
     );
 
     if let Some(focused_window) = focused_window {
@@ -557,8 +571,11 @@ fn compatible_windows(
     visible_windows
 }
 
-fn sorted_ax_windows(ax_windows: HashMap<CGWindowID, AxInfo>) -> Vec<(CGWindowID, AxInfo)> {
-    let mut windows = ax_windows.into_iter().collect::<Vec<_>>();
+fn sorted_ax_windows(ax_windows: &HashMap<CGWindowID, AxInfo>) -> Vec<(CGWindowID, &AxInfo)> {
+    let mut windows = ax_windows
+        .iter()
+        .map(|(id, ax)| (*id, ax))
+        .collect::<Vec<_>>();
     windows.sort_by_key(|(id, _)| *id);
     windows
 }
@@ -1405,7 +1422,7 @@ mod tests {
         }];
         let ax_windows = HashMap::from([(42, test_ax_info(9, "Edge", "AXStandardWindow"))]);
 
-        let windows = compatible_windows(raw_windows, ax_windows, Some(42));
+        let windows = compatible_windows(raw_windows, &ax_windows, Some(42));
 
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].id, 42);
@@ -1428,7 +1445,7 @@ mod tests {
             (75, test_ax_info(13, "Notes", "AXStandardWindow")),
         ]);
 
-        let windows = compatible_windows(raw_windows, ax_windows, Some(98));
+        let windows = compatible_windows(raw_windows, &ax_windows, Some(98));
 
         assert_eq!(
             windows.iter().map(|window| window.id).collect::<Vec<_>>(),
@@ -1452,7 +1469,7 @@ mod tests {
             (280, test_ax_info(12, "App", "AXStandardWindow")),
         ]);
 
-        let windows = compatible_windows(raw_windows, ax_windows, None);
+        let windows = compatible_windows(raw_windows, &ax_windows, None);
 
         assert_eq!(
             windows.iter().map(|window| window.id).collect::<Vec<_>>(),
@@ -1465,7 +1482,18 @@ mod tests {
     fn compatible_windows_exclude_non_standard_ax_windows() {
         let ax_windows = HashMap::from([(7, test_ax_info(8, "System", "AXSystemDialog"))]);
 
-        assert!(compatible_windows(Vec::new(), ax_windows, None).is_empty());
+        assert!(compatible_windows(Vec::new(), &ax_windows, None).is_empty());
+    }
+
+    #[test]
+    fn compatible_windows_leaves_ax_windows_available_for_focus() {
+        let raw_windows = vec![test_raw_window(42, "App", true)];
+        let ax_windows = HashMap::from([(42, test_ax_info(8, "App", "AXStandardWindow"))]);
+
+        let windows = compatible_windows(raw_windows, &ax_windows, Some(42));
+
+        assert_eq!(windows[0].id, 42);
+        assert!(ax_windows.contains_key(&42));
     }
 
     #[test]
