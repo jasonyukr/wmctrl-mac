@@ -78,6 +78,7 @@ enum Command {
     QueryWindows { space: Option<i32> },
     ListWnd { sort: bool, space: Option<i32> },
     FocusWindow { id: CGWindowID },
+    FocusAdjacentWindow { direction: FocusDirection },
     FocusOtherWindow { direction: FocusDirection },
 }
 
@@ -217,6 +218,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         Command::ListWnd { sort, space } => print_listwnd(query_windows()?, sort, space),
         Command::FocusWindow { id } => focus_window(id),
+        Command::FocusAdjacentWindow { direction } => focus_adjacent_window(direction),
         Command::FocusOtherWindow { direction } => focus_other_window(direction),
     }
 }
@@ -239,6 +241,16 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }
         [mode, command] if mode == "-m" && command == "focus-other-prev-window" => {
             Ok(Command::FocusOtherWindow {
+                direction: FocusDirection::Prev,
+            })
+        }
+        [mode, command] if mode == "-m" && command == "focus-next-window" => {
+            Ok(Command::FocusAdjacentWindow {
+                direction: FocusDirection::Next,
+            })
+        }
+        [mode, command] if mode == "-m" && command == "focus-prev-window" => {
+            Ok(Command::FocusAdjacentWindow {
                 direction: FocusDirection::Prev,
             })
         }
@@ -340,6 +352,39 @@ fn focus_other_window(direction: FocusDirection) -> Result<(), String> {
         focus_ax_window(ax)?;
     }
     Ok(())
+}
+
+fn focus_adjacent_window(direction: FocusDirection) -> Result<(), String> {
+    let raw_windows = cg_windows()?;
+    let ax_windows = collect_ax_windows(&raw_window_applications(&raw_windows));
+    let focused_window = focused_window_id();
+    let windows = compatible_windows(raw_windows, &ax_windows, focused_window);
+    let focus_target = select_adjacent_window(&windows, direction);
+    if let Some(id) = focus_target {
+        let ax = ax_windows.get(&(id as CGWindowID)).ok_or_else(|| {
+            "unable to resolve AX window; grant Accessibility permission or focus the window's space".to_string()
+        })?;
+        ensure_ax_trusted()?;
+        focus_ax_window(ax)?;
+    }
+    Ok(())
+}
+
+fn select_adjacent_window(windows: &[Window], direction: FocusDirection) -> Option<i32> {
+    let (qlines, focused) = focus_other_qlines(windows)?;
+    let list = qlines
+        .iter()
+        .filter(|window| window.space == focused.space && window.app == focused.app)
+        .map(|window| window.id)
+        .collect::<Vec<_>>();
+    let focused_index = list.iter().position(|id| *id == focused.id)?;
+
+    match direction {
+        FocusDirection::Next => list.get((focused_index + 1) % list.len()).copied(),
+        FocusDirection::Prev => list
+            .get((focused_index + list.len() - 1) % list.len())
+            .copied(),
+    }
 }
 
 fn select_other_window(
@@ -1165,6 +1210,18 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_command(&args(&["-m", "focus-next-window"])),
+            Ok(Command::FocusAdjacentWindow {
+                direction: FocusDirection::Next
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&["-m", "focus-prev-window"])),
+            Ok(Command::FocusAdjacentWindow {
+                direction: FocusDirection::Prev
+            })
+        );
+        assert_eq!(
             parse_command(&args(&["-m", "window", "--focus", "42"])),
             Ok(Command::FocusWindow { id: 42 })
         );
@@ -1293,6 +1350,50 @@ mod tests {
             ]
         );
         assert!(listwnd_lines(&windows, false, Some(2)).is_empty());
+    }
+
+    #[test]
+    fn focus_adjacent_window_wraps_same_app_next_and_prev() {
+        let windows = vec![
+            test_window(1, "App", false),
+            test_window(2, "App", true),
+            test_window(3, "App", false),
+            test_window(4, "Other", false),
+        ];
+
+        assert_eq!(
+            select_adjacent_window(&windows, FocusDirection::Next),
+            Some(3)
+        );
+        assert_eq!(
+            select_adjacent_window(&windows, FocusDirection::Prev),
+            Some(1)
+        );
+
+        let windows = vec![
+            test_window(1, "App", true),
+            test_window(2, "App", false),
+            test_window(3, "Other", false),
+        ];
+
+        assert_eq!(
+            select_adjacent_window(&windows, FocusDirection::Prev),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn focus_adjacent_window_uses_current_space_and_keeps_deskflow() {
+        let focused = test_window(1, "Deskflow", true);
+        let other_deskflow = test_window(2, "Deskflow", false);
+        let mut other_space = test_window(3, "Deskflow", false);
+        other_space.space = 2;
+        let windows = vec![focused, other_deskflow, other_space];
+
+        assert_eq!(
+            select_adjacent_window(&windows, FocusDirection::Next),
+            Some(2)
+        );
     }
 
     #[test]
