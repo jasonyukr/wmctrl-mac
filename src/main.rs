@@ -22,8 +22,11 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::CStr;
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::process;
+use std::process::Stdio;
+use std::time::SystemTime;
 
 type CGWindowID = c_uint;
 type AXError = c_int;
@@ -40,6 +43,8 @@ type OptionBits = u32;
 type Size = libc::c_long;
 type AEAddressDesc = AEDesc;
 type AppleEvent = AEDesc;
+
+const KITTY_BUNDLE_ID: &str = "net.kovidgoyal.kitty";
 
 #[repr(C, packed(2))]
 struct AEDesc {
@@ -150,10 +155,11 @@ enum Command {
     FocusAdjacentWindow { direction: FocusDirection },
     FocusOtherWindow { direction: FocusDirection },
     SendToBack,
+    Launch { app_name: String },
     LaunchOrFocus { app_name: String },
 }
 
-const HELP: &str = "Usage:\n  wmctrl-mac --help\n  wmctrl-mac -h\n  wmctrl-mac -m query --spaces\n  wmctrl-mac -m query --windows\n  wmctrl-mac -m query --windows --space <index>\n  wmctrl-mac -m window --focus <id>\n  wmctrl-mac -m listwnd [-s] [space]\n  wmctrl-mac listwnd [-s] [space]\n  wmctrl-mac -m focus-next-window\n  wmctrl-mac -m focus-prev-window\n  wmctrl-mac -m focus-other-next-window\n  wmctrl-mac -m focus-other-prev-window\n  wmctrl-mac -m send-to-back\n  wmctrl-mac -m launch-or-focus <app name>";
+const HELP: &str = "Usage:\n  wmctrl-mac --help\n  wmctrl-mac -h\n  wmctrl-mac -m query --spaces\n  wmctrl-mac -m query --windows\n  wmctrl-mac -m query --windows --space <index>\n  wmctrl-mac -m window --focus <id>\n  wmctrl-mac -m listwnd [-s] [space]\n  wmctrl-mac listwnd [-s] [space]\n  wmctrl-mac -m focus-next-window\n  wmctrl-mac -m focus-prev-window\n  wmctrl-mac -m focus-other-next-window\n  wmctrl-mac -m focus-other-prev-window\n  wmctrl-mac -m send-to-back\n  wmctrl-mac -m launch <app name>\n  wmctrl-mac -m launch-or-focus <app name>";
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum FocusDirection {
@@ -247,6 +253,12 @@ struct Window {
     is_grabbed: bool,
 }
 
+struct RunningApplication {
+    localized_name: String,
+    bundle_identifier: Option<String>,
+    bundle_path: Option<PathBuf>,
+}
+
 #[derive(Serialize)]
 struct Space {
     id: i32,
@@ -331,6 +343,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Command::FocusAdjacentWindow { direction } => focus_adjacent_window(direction),
         Command::FocusOtherWindow { direction } => focus_other_window(direction),
         Command::SendToBack => send_focused_window_to_back(),
+        Command::Launch { app_name } => launch_application(&app_name),
         Command::LaunchOrFocus { app_name } => launch_or_focus_application(&app_name),
     }
 }
@@ -346,6 +359,9 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }
         [mode, command, args @ ..] if mode == "-m" && command == "listwnd" => {
             parse_listwnd_command(args)
+        }
+        [mode, command, args @ ..] if mode == "-m" && command == "launch" => {
+            parse_launch_command(args)
         }
         [mode, command, args @ ..] if mode == "-m" && command == "launch-or-focus" => {
             parse_launch_or_focus_command(args)
@@ -391,6 +407,14 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }
         _ => Err("unsupported command".to_string()),
     }
+}
+
+fn parse_launch_command(args: &[String]) -> Result<Command, String> {
+    let app_name = args.join(" ");
+    if app_name.trim().is_empty() {
+        return Err("launch requires an app name".to_string());
+    }
+    Ok(Command::Launch { app_name })
 }
 
 fn parse_launch_or_focus_command(args: &[String]) -> Result<Command, String> {
@@ -1304,6 +1328,158 @@ fn running_applications() -> HashMap<pid_t, String> {
     }
 }
 
+fn launch_application(app_name: &str) -> Result<(), String> {
+    if app_name.contains('/') {
+        return Err("launch only supports application names, not paths".to_string());
+    }
+
+    let Some(application) = find_running_application(app_name)? else {
+        return launch_or_focus_application(app_name);
+    };
+
+    if application.bundle_identifier.as_deref() == Some(KITTY_BUNDLE_ID) {
+        if try_kitty_launch(&application) {
+            return Ok(());
+        }
+    } else if let Some(bundle_identifier) = application.bundle_identifier.as_deref() {
+        if try_scriptable_launch(bundle_identifier) {
+            return Ok(());
+        }
+    }
+
+    launch_or_focus_application(&application.localized_name)
+}
+
+fn find_running_application(app_name: &str) -> Result<Option<RunningApplication>, String> {
+    unsafe {
+        let Some(class) = Class::get("NSWorkspace") else {
+            return Err("NSWorkspace is unavailable".to_string());
+        };
+        let workspace: *mut Object = msg_send![class, sharedWorkspace];
+        if workspace.is_null() {
+            return Err("NSWorkspace is unavailable".to_string());
+        }
+        let applications: *mut Object = msg_send![workspace, runningApplications];
+        if applications.is_null() {
+            return Err("NSWorkspace runningApplications is unavailable".to_string());
+        }
+
+        let count: usize = msg_send![applications, count];
+        for index in 0..count {
+            let application: *mut Object = msg_send![applications, objectAtIndex: index];
+            if application.is_null() {
+                continue;
+            }
+
+            let name: *mut Object = msg_send![application, localizedName];
+            let localized_name = cf_string(name as CFStringRef).unwrap_or_default();
+            let bundle_identifier = running_application_bundle_identifier(application);
+            if app_name_matches(&localized_name, app_name)
+                || bundle_identifier
+                    .as_deref()
+                    .is_some_and(|bundle_identifier| app_name_matches(bundle_identifier, app_name))
+            {
+                return Ok(Some(RunningApplication {
+                    localized_name,
+                    bundle_identifier,
+                    bundle_path: running_application_bundle_path(application),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+fn try_kitty_launch(application: &RunningApplication) -> bool {
+    let Some(executable) = kitty_executable_path(application) else {
+        return false;
+    };
+
+    for socket in kitty_socket_paths() {
+        let status = process::Command::new(&executable)
+            .args(["@", "--to"])
+            .arg(format!("unix:{}", socket.display()))
+            .args(["launch", "--type=os-window"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if status.is_ok_and(|status| status.success()) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn kitty_executable_path(application: &RunningApplication) -> Option<PathBuf> {
+    if let Some(bundle_path) = application.bundle_path.as_ref() {
+        let executable = bundle_path.join("Contents/MacOS/kitty");
+        if executable.is_file() {
+            return Some(executable);
+        }
+    }
+    Some(PathBuf::from("kitty"))
+}
+
+fn kitty_socket_paths() -> Vec<PathBuf> {
+    let mut sockets = Vec::new();
+    let mut dirs = Vec::new();
+    if let Ok(tmpdir) = env::var("TMPDIR") {
+        dirs.push(PathBuf::from(tmpdir));
+    }
+    dirs.push(PathBuf::from("/tmp"));
+
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("kitty"))
+            {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.file_type().is_socket() {
+                sockets.push((metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH), path));
+            }
+        }
+    }
+
+    sockets.sort_by(|left, right| right.0.cmp(&left.0));
+    sockets.into_iter().map(|(_, path)| path).collect()
+}
+
+fn try_scriptable_launch(bundle_identifier: &str) -> bool {
+    let finder_window_script = format!(
+        "tell application id \"{bundle_identifier}\" to make new Finder window"
+    );
+    let window_script = format!("tell application id \"{bundle_identifier}\" to make new window");
+
+    if run_osascript(&finder_window_script) || run_osascript(&window_script) {
+        let activate_script = format!("tell application id \"{bundle_identifier}\" to activate");
+        run_osascript(&activate_script);
+        return true;
+    }
+
+    false
+}
+
+fn run_osascript(script: &str) -> bool {
+    process::Command::new("osascript")
+        .args(["-e", script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn launch_or_focus_application(app_name: &str) -> Result<(), String> {
     if app_name.contains('/') {
         return Err("launch-or-focus only supports application names, not paths".to_string());
@@ -1403,6 +1579,20 @@ unsafe fn launch_running_application_url(
     }
 
     unsafe { LSOpenCFURLRef(url as CFTypeRef, std::ptr::null_mut()) }
+}
+
+unsafe fn running_application_bundle_identifier(application: *mut Object) -> Option<String> {
+    let bundle_identifier: *mut Object = unsafe { msg_send![application, bundleIdentifier] };
+    cf_string(bundle_identifier as CFStringRef)
+}
+
+unsafe fn running_application_bundle_path(application: *mut Object) -> Option<PathBuf> {
+    let bundle_url: *mut Object = unsafe { msg_send![application, bundleURL] };
+    if bundle_url.is_null() {
+        return None;
+    }
+    let path: *mut Object = unsafe { msg_send![bundle_url, path] };
+    cf_string(path as CFStringRef).map(PathBuf::from)
 }
 
 unsafe fn send_reopen_application(pid: pid_t) -> OSStatus {
@@ -1810,6 +2000,18 @@ mod tests {
             Ok(Command::FocusWindow { id: 42 })
         );
         assert_eq!(
+            parse_command(&args(&["-m", "launch", "Finder"])),
+            Ok(Command::Launch {
+                app_name: "Finder".to_string()
+            })
+        );
+        assert_eq!(
+            parse_command(&args(&["-m", "launch", "Microsoft", "Edge"])),
+            Ok(Command::Launch {
+                app_name: "Microsoft Edge".to_string()
+            })
+        );
+        assert_eq!(
             parse_command(&args(&["-m", "launch-or-focus", "Finder"])),
             Ok(Command::LaunchOrFocus {
                 app_name: "Finder".to_string()
@@ -1852,6 +2054,10 @@ mod tests {
         assert_eq!(
             parse_command(&args(&["-m", "window", "--focus", "abc"])),
             Err("--focus requires a numeric window id".to_string())
+        );
+        assert_eq!(
+            parse_command(&args(&["-m", "launch"])),
+            Err("launch requires an app name".to_string())
         );
         assert_eq!(
             parse_command(&args(&["-m", "launch-or-focus"])),

@@ -17,6 +17,7 @@ Compact `yabai` shim for scripts that only need a small query/focus subset on ma
 - `wmctrl-mac -m focus-other-next-window`
 - `wmctrl-mac -m focus-other-prev-window`
 - `wmctrl-mac -m send-to-back`
+- `wmctrl-mac -m launch <app name>`
 - `wmctrl-mac -m launch-or-focus <app name>`
 
 This is not a full yabai replacement. Other yabai commands, selectors, filters, multi-space behavior, rules, layouts, and window management actions are unsupported.
@@ -46,6 +47,8 @@ Install or copy `target/release/wmctrl-mac` to the path your scripts call.
 `wmctrl-mac -m focus-other-next-window` and `wmctrl-mac -m focus-other-prev-window` cycle focus between one representative window per app on the focused space, remembering the last focused window for each app in `${TMPDIR:-/tmp}`.
 
 `wmctrl-mac -m send-to-back` sends the focused Accessibility window behind other compatible windows by raising those windows in current stacking order. If no focused window is found, it exits successfully without changing window focus.
+
+`wmctrl-mac -m launch <app name>` opens a new window for a running app when supported, then falls back to launch-or-focus behavior. Running apps may be matched by exact or case-insensitive localized name or bundle id. For kitty, it tries remote-control OS-window creation using the resolved app bundle before falling back; for other running apps with bundle ids, it tries AppleScript new-window commands before falling back. App names may be passed as one shell argument or multiple trailing arguments joined with spaces; paths are not supported.
 
 `wmctrl-mac -m launch-or-focus <app name>` focuses a running app with a matching localized name, or asks macOS to launch the app by name. App names may be passed as one shell argument or multiple trailing arguments joined with spaces; paths are not supported.
 
