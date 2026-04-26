@@ -16,6 +16,7 @@ Compact `yabai` shim for scripts that only need a small query/focus subset on ma
 - `wmctrl-mac -m focus-prev-window`
 - `wmctrl-mac -m focus-other-next-window`
 - `wmctrl-mac -m focus-other-prev-window`
+- `wmctrl-mac -m send-to-back`
 - `wmctrl-mac -m launch-or-focus <app name>`
 
 This is not a full yabai replacement. Other yabai commands, selectors, filters, multi-space behavior, rules, layouts, and window management actions are unsupported.
@@ -43,6 +44,8 @@ Install or copy `target/release/wmctrl-mac` to the path your scripts call.
 `wmctrl-mac -m focus-next-window` and `wmctrl-mac -m focus-prev-window` cycle focus between windows from the currently focused app on the focused space.
 
 `wmctrl-mac -m focus-other-next-window` and `wmctrl-mac -m focus-other-prev-window` cycle focus between one representative window per app on the focused space, remembering the last focused window for each app in `${TMPDIR:-/tmp}`.
+
+`wmctrl-mac -m send-to-back` sends the focused Accessibility window behind other compatible windows by raising those windows in current stacking order. If no focused window is found, it exits successfully without changing window focus.
 
 `wmctrl-mac -m launch-or-focus <app name>` focuses a running app with a matching localized name, or asks macOS to launch the app by name. App names may be passed as one shell argument or multiple trailing arguments joined with spaces; paths are not supported.
 

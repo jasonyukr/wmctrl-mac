@@ -81,10 +81,11 @@ enum Command {
     FocusWindow { id: CGWindowID },
     FocusAdjacentWindow { direction: FocusDirection },
     FocusOtherWindow { direction: FocusDirection },
+    SendToBack,
     LaunchOrFocus { app_name: String },
 }
 
-const HELP: &str = "Usage:\n  wmctrl-mac --help\n  wmctrl-mac -h\n  wmctrl-mac -m query --spaces\n  wmctrl-mac -m query --windows\n  wmctrl-mac -m query --windows --space <index>\n  wmctrl-mac -m window --focus <id>\n  wmctrl-mac -m listwnd [-s] [space]\n  wmctrl-mac listwnd [-s] [space]\n  wmctrl-mac -m focus-next-window\n  wmctrl-mac -m focus-prev-window\n  wmctrl-mac -m focus-other-next-window\n  wmctrl-mac -m focus-other-prev-window\n  wmctrl-mac -m launch-or-focus <app name>";
+const HELP: &str = "Usage:\n  wmctrl-mac --help\n  wmctrl-mac -h\n  wmctrl-mac -m query --spaces\n  wmctrl-mac -m query --windows\n  wmctrl-mac -m query --windows --space <index>\n  wmctrl-mac -m window --focus <id>\n  wmctrl-mac -m listwnd [-s] [space]\n  wmctrl-mac listwnd [-s] [space]\n  wmctrl-mac -m focus-next-window\n  wmctrl-mac -m focus-prev-window\n  wmctrl-mac -m focus-other-next-window\n  wmctrl-mac -m focus-other-prev-window\n  wmctrl-mac -m send-to-back\n  wmctrl-mac -m launch-or-focus <app name>";
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum FocusDirection {
@@ -240,6 +241,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Command::FocusWindow { id } => focus_window(id),
         Command::FocusAdjacentWindow { direction } => focus_adjacent_window(direction),
         Command::FocusOtherWindow { direction } => focus_other_window(direction),
+        Command::SendToBack => send_focused_window_to_back(),
         Command::LaunchOrFocus { app_name } => launch_or_focus_application(&app_name),
     }
 }
@@ -279,6 +281,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 direction: FocusDirection::Prev,
             })
         }
+        [mode, command] if mode == "-m" && command == "send-to-back" => Ok(Command::SendToBack),
         [command, args @ ..] if command == "listwnd" => parse_listwnd_command(args),
         [mode, query, target, space_flag, space]
             if mode == "-m"
@@ -419,6 +422,48 @@ fn focus_adjacent_window_fallback(direction: FocusDirection) -> Result<(), Strin
         focus_ax_window(ax)?;
     }
     Ok(())
+}
+
+fn send_focused_window_to_back() -> Result<(), String> {
+    let Some(focused_window) = focused_window_id() else {
+        return Ok(());
+    };
+    ensure_ax_trusted()?;
+    let raw_windows = focus_raw_windows()?;
+    let ax_windows = collect_focus_ax_windows(&raw_window_applications(&raw_windows));
+    for id in send_to_back_raise_order(&raw_windows, &ax_windows, focused_window) {
+        if let Some(ax) = ax_windows.get(&id) {
+            raise_ax_window(ax)?;
+        }
+    }
+    Ok(())
+}
+
+fn send_to_back_raise_order(
+    raw_windows: &[RawWindow],
+    ax_windows: &HashMap<CGWindowID, AxInfo>,
+    focused_window: CGWindowID,
+) -> Vec<CGWindowID> {
+    let visible_ids = raw_windows
+        .iter()
+        .map(|raw| raw.id as CGWindowID)
+        .collect::<HashSet<_>>();
+    let mut ids = raw_windows
+        .iter()
+        .rev()
+        .map(|raw| raw.id as CGWindowID)
+        .filter(|id| *id != focused_window)
+        .filter(|id| ax_windows.get(id).is_some_and(is_compatible_ax_window))
+        .collect::<Vec<_>>();
+    ids.extend(
+        sorted_ax_windows(ax_windows)
+            .into_iter()
+            .filter(|(id, ax)| {
+                *id != focused_window && !visible_ids.contains(id) && is_compatible_ax_window(ax)
+            })
+            .map(|(id, _)| id),
+    );
+    ids
 }
 
 fn select_adjacent_window(windows: &[FocusCandidate], direction: FocusDirection) -> Option<i32> {
@@ -656,6 +701,18 @@ fn focus_ax_window(ax: &AxInfo) -> Result<(), String> {
         CFRelease(app as CFTypeRef);
         if set_result != K_AX_ERROR_SUCCESS {
             return Err("unable to focus AX window; check Accessibility permission".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn raise_ax_window(ax: &AxInfo) -> Result<(), String> {
+    unsafe {
+        let raise_action = cf_string_create("AXRaise");
+        let result = AXUIElementPerformAction(ax.element, raise_action);
+        CFRelease(raise_action as CFTypeRef);
+        if result != K_AX_ERROR_SUCCESS {
+            return Err("unable to raise AX window; check Accessibility permission".to_string());
         }
     }
     Ok(())
@@ -1478,6 +1535,10 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_command(&args(&["-m", "send-to-back"])),
+            Ok(Command::SendToBack)
+        );
+        assert_eq!(
             parse_command(&args(&["-m", "window", "--focus", "42"])),
             Ok(Command::FocusWindow { id: 42 })
         );
@@ -1701,6 +1762,26 @@ mod tests {
             vec![1, 2]
         );
         assert!(candidates[1].has_focus);
+    }
+
+    #[test]
+    fn send_to_back_raise_order_uses_reverse_cg_order_then_ax_only() {
+        let raw_windows = vec![
+            test_raw_window(1, "App", true),
+            test_raw_window(2, "App", true),
+            test_raw_window(3, "Other", true),
+        ];
+        let ax_windows = HashMap::from([
+            (1, test_ax_info(8, "App", "AXStandardWindow")),
+            (2, test_ax_info(8, "App", "AXStandardWindow")),
+            (3, test_ax_info(9, "Other", "AXSystemDialog")),
+            (4, test_ax_info(10, "Third", "AXStandardWindow")),
+        ]);
+
+        assert_eq!(
+            send_to_back_raise_order(&raw_windows, &ax_windows, 1),
+            vec![2, 4]
+        );
     }
 
     #[test]
