@@ -45,6 +45,7 @@ type AEAddressDesc = AEDesc;
 type AppleEvent = AEDesc;
 
 const KITTY_BUNDLE_ID: &str = "net.kovidgoyal.kitty";
+const WEZTERM_BUNDLE_ID: &str = "com.github.wez.wezterm";
 
 #[repr(C, packed(2))]
 struct AEDesc {
@@ -1341,6 +1342,10 @@ fn launch_application(app_name: &str) -> Result<(), String> {
         if try_kitty_launch(&application) {
             return Ok(());
         }
+    } else if application.bundle_identifier.as_deref() == Some(WEZTERM_BUNDLE_ID) {
+        if try_wezterm_launch(&application) {
+            return Ok(());
+        }
     } else if let Some(bundle_identifier) = application.bundle_identifier.as_deref() {
         if try_scriptable_launch(bundle_identifier) {
             return Ok(());
@@ -1410,6 +1415,31 @@ fn try_kitty_launch(application: &RunningApplication) -> bool {
     }
 
     false
+}
+
+fn try_wezterm_launch(application: &RunningApplication) -> bool {
+    let executable = wezterm_executable_path(application);
+    let status = process::Command::new(&executable)
+        .args(["cli", "spawn", "--new-window"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !status.is_ok_and(|status| status.success()) {
+        return false;
+    }
+
+    let _ = launch_or_focus_application(&application.localized_name);
+    true
+}
+
+fn wezterm_executable_path(application: &RunningApplication) -> PathBuf {
+    if let Some(bundle_path) = application.bundle_path.as_ref() {
+        let executable = bundle_path.join("Contents/MacOS/wezterm");
+        if executable.is_file() {
+            return executable;
+        }
+    }
+    PathBuf::from("wezterm")
 }
 
 fn kitty_executable_path(application: &RunningApplication) -> Option<PathBuf> {
